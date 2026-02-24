@@ -1,0 +1,8 @@
+stack_name               = "n8n-demo"
+environment_name         = "demo"
+root_domain              = "example.com"
+subdomain                = "n8n-demo"
+letsencrypt_email        = "you@example.com"
+n8n_basic_auth_user      = "set-a-username"
+n8n_basic_auth_password  = "set-a-very-strong-password"
+default_timezone         = "America/Santiago"

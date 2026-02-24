@@ -1,0 +1,114 @@
+#!/bin/bash
+set -euo pipefail
+
+FQDN="${fqdn}"
+TIMEZONE="${timezone}"
+DATA_DEVICE="${data_device}"
+DATA_MOUNT="/opt/n8n"
+
+timedatectl set-timezone "$TIMEZONE"
+dnf update -y
+dnf install -y docker
+dnf install -y curl --allowerasing
+dnf install -y amazon-ssm-agent xfsprogs
+
+systemctl enable amazon-ssm-agent
+systemctl start amazon-ssm-agent
+
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -L "https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-x86_64" -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+systemctl enable docker
+systemctl start docker
+usermod -aG docker ec2-user
+
+# Espera a que el volumen de datos esté adjunto
+for i in {1..30}; do
+  if [ -b "$DATA_DEVICE" ]; then
+    break
+  fi
+  # Intentar detectar dispositivos NVMe secundarios (ej. /dev/nvme1n1) si el alias /dev/xvdf no existe
+  SECONDARY_NVME=$(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}' | grep nvme | grep -v nvme0n1 | head -n1 || true)
+  if [ -n "$SECONDARY_NVME" ] && [ -b "$SECONDARY_NVME" ]; then
+    DATA_DEVICE="$SECONDARY_NVME"
+    break
+  fi
+  sleep 2
+done
+
+if [ ! -b "$DATA_DEVICE" ]; then
+  echo "No se encontró el dispositivo de datos $DATA_DEVICE" >&2
+  exit 1
+fi
+
+if ! blkid "$DATA_DEVICE"; then
+  mkfs.xfs "$DATA_DEVICE"
+fi
+
+mkdir -p "$DATA_MOUNT"
+if ! grep -qs "$DATA_MOUNT" /etc/fstab; then
+  echo "$DATA_DEVICE $DATA_MOUNT xfs defaults,nofail 0 2" >> /etc/fstab
+fi
+if ! mountpoint -q "$DATA_MOUNT"; then
+  mount "$DATA_MOUNT"
+fi
+chown ec2-user:ec2-user "$DATA_MOUNT"
+
+cd /opt/n8n
+
+cat <<"EOF" >/opt/n8n/docker-compose.yml
+version: "3.8"
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    environment:
+      - N8N_HOST=${fqdn}
+      - N8N_PROTOCOL=https
+      - N8N_PORT=5678
+      - WEBHOOK_URL=https://${fqdn}/
+      - N8N_EDITOR_BASE_URL=https://${fqdn}/
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${n8n_basic_auth_user}
+      - N8N_BASIC_AUTH_PASSWORD=${n8n_basic_auth_pass}
+      - N8N_ENCRYPTION_KEY=${n8n_encryption_key}
+      - GENERIC_TIMEZONE=${timezone}
+    ports:
+      - "127.0.0.1:5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+  caddy:
+    image: caddy:2.7-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - n8n
+
+volumes:
+  n8n_data:
+  caddy_data:
+  caddy_config:
+EOF
+
+cat <<"EOF" >/opt/n8n/Caddyfile
+%{ if trimspace(letsencrypt_email) != "" }
+{
+  email ${letsencrypt_email}
+}
+%{ endif }
+${fqdn} {
+  encode zstd gzip
+  reverse_proxy n8n:5678
+}
+EOF
+
+chown -R ec2-user:ec2-user /opt/n8n
+/usr/bin/docker compose pull
+/usr/bin/docker compose up -d

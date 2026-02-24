@@ -1,0 +1,3 @@
+# Copy this file to backend.hcl and set your real bucket name.
+# Do not commit backend.hcl.
+bucket = "your-unique-demo-terraform-state-bucket-name"
